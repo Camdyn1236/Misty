@@ -1,4 +1,3 @@
-
 name: MistyTemp Dual Unity Android Build
 
 on:
@@ -30,9 +29,11 @@ jobs:
           - arm64-v8a
 
     steps:
+      # 1. Download repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2. Locate and extract ZIP
       - name: Locate and extract project ZIP
         id: project
         shell: bash
@@ -42,35 +43,36 @@ jobs:
           VARIANT="${{ matrix.variant }}"
           PROJECT_DIR=""
 
-          # Check whether the project is already extracted.
+          echo "Looking for project: ${VARIANT}"
+
+          # Already extracted into repository
           if [[ -f "${VARIANT}/gradlew" && -d "${VARIANT}/app" ]]; then
             PROJECT_DIR="${VARIANT}"
 
+          # Project is repository root
           elif [[ -f "gradlew" && -d "app" ]]; then
             PROJECT_DIR="."
 
           else
-            # Look for the exact ZIP name first.
             ZIP_PATH="./MistyTemp_AntiQuit_DualUnity.zip"
 
-            # Fall back to any MistyTemp ZIP in the repository.
+            # Find ZIP if filename or location differs
             if [[ ! -f "${ZIP_PATH}" ]]; then
-              ZIP_PATH="$(find . -maxdepth 4 -type f \
+              ZIP_PATH="$(find . -maxdepth 5 -type f \
                 -iname 'MistyTemp*.zip' -print -quit)"
             fi
 
             if [[ -z "${ZIP_PATH}" || ! -f "${ZIP_PATH}" ]]; then
-              echo "::error::MistyTemp ZIP was not found."
-              echo "Repository contents:"
-              find . -maxdepth 4 -type f | sort | head -300
+              echo "::error::Project ZIP not found."
+              find . -maxdepth 5 -type f | sort | head -300
               exit 1
             fi
 
-            echo "Found ZIP: ${ZIP_PATH}"
+            echo "ZIP found: ${ZIP_PATH}"
 
             mkdir -p .build-source
 
-            # Python supports the LZMA compression used by the updated ZIP.
+            # Python extraction supports LZMA-compressed ZIP files.
             python3 - "${ZIP_PATH}" <<'PY'
           import sys
           import zipfile
@@ -80,59 +82,67 @@ jobs:
           try:
               with zipfile.ZipFile(zip_path, "r") as archive:
                   bad_file = archive.testzip()
+
                   if bad_file:
-                      raise RuntimeError(f"Corrupt ZIP entry: {bad_file}")
+                      raise RuntimeError(
+                          f"Corrupt ZIP entry: {bad_file}"
+                      )
 
                   archive.extractall(".build-source")
 
-          except Exception as error:
-              print(f"ZIP extraction failed: {error}", file=sys.stderr)
-              sys.exit(1)
+              print("ZIP integrity verified.")
+              print("ZIP extraction completed.")
 
-          print("ZIP extracted and integrity checked.")
+          except Exception as error:
+              print(f"Extraction failed: {error}", file=sys.stderr)
+              sys.exit(1)
           PY
 
-            # Confirm the expected Unity project exists.
+            # Find requested Unity project
             if [[ -f ".build-source/${VARIANT}/gradlew" && \
                   -d ".build-source/${VARIANT}/app" ]]; then
+
               PROJECT_DIR=".build-source/${VARIANT}"
+
             else
-              echo "::error::Could not find ${VARIANT} inside the extracted ZIP."
-              echo "Found Gradle projects:"
-              find .build-source -maxdepth 5 -type f \
+              echo "::error::${VARIANT} was not found in ZIP."
+
+              find .build-source -maxdepth 5 \
                 \( -name gradlew -o -name build.gradle \) -print
+
               exit 1
             fi
           fi
 
-          if [[ ! -f "${PROJECT_DIR}/app/build.gradle" ]]; then
-            echo "::error::app/build.gradle is missing."
-            exit 1
-          fi
+          # Verify project structure
+          test -f "${PROJECT_DIR}/gradlew"
+          test -f "${PROJECT_DIR}/app/build.gradle"
 
-          if [[ ! -f "${PROJECT_DIR}/gradlew" ]]; then
-            echo "::error::Gradle wrapper is missing."
-            exit 1
-          fi
+          echo "project_dir=${PROJECT_DIR}" >> "$GITHUB_OUTPUT"
 
-          echo "project_dir=${PROJECT_DIR}" >> "${GITHUB_OUTPUT}"
-          echo "Building: ${PROJECT_DIR}"
+          echo "Selected project: ${PROJECT_DIR}"
 
+      # 3. Install Java
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
 
+      # 4. Install Android SDK command-line tools
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
 
+      # 5. Install required SDK packages
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
 
-          yes | sdkmanager --licenses >/dev/null
+          echo "Installing Android SDK components..."
 
           sdkmanager --install \
             "platform-tools" \
@@ -141,9 +151,15 @@ jobs:
             "ndk;${NDK_VERSION}" \
             "cmake;${CMAKE_VERSION}"
 
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "${GITHUB_ENV}"
-          echo "ANDROID_SDK_ROOT=${ANDROID_HOME}" >> "${GITHUB_ENV}"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
 
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+          echo "SDK installation completed."
+
+      # 6. Configure Gradle
       - name: Configure Gradle
         working-directory: ${{ steps.project.outputs.project_dir }}
         shell: bash
@@ -154,22 +170,26 @@ jobs:
 
           cat > local.properties <<EOF
           sdk.dir=${ANDROID_HOME}
-          ndk.dir=${ANDROID_HOME}/ndk/${NDK_VERSION}
+          ndk.dir=${ANDROID_NDK_HOME}
           EOF
 
           ./gradlew --version
 
+      # 7. Compile Android APK
       - name: Build Android APK
         working-directory: ${{ steps.project.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "Building ${{ matrix.variant }}"
+
           ./gradlew :app:assembleDebug \
             --stacktrace \
             --no-daemon \
             -Pandroid.injected.build.abi="${{ matrix.abi }}"
 
+      # 8. Verify APK
       - name: Verify APK output
         working-directory: ${{ steps.project.outputs.project_dir }}
         shell: bash
@@ -179,18 +199,22 @@ jobs:
           APK_DIR="app/build/outputs/apk/debug"
 
           if [[ ! -d "${APK_DIR}" ]]; then
-            echo "::error::APK output directory was not created."
+            echo "::error::APK output directory missing."
             exit 1
           fi
 
-          find "${APK_DIR}" -type f -name "*.apk" -print
+          APK_COUNT=$(find "${APK_DIR}" -type f -name "*.apk" | wc -l)
 
-          if ! find "${APK_DIR}" -type f -name "*.apk" | grep -q .; then
+          if [[ "${APK_COUNT}" -eq 0 ]]; then
             echo "::error::No APK was generated."
             exit 1
           fi
 
-      - name: Upload APK and native libraries
+          echo "Generated APK files:"
+          find "${APK_DIR}" -type f -name "*.apk" -print
+
+      # 9. Upload APK and native libraries
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mistytemp-${{ matrix.variant }}-${{ matrix.abi }}
