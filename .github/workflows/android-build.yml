@@ -1,4 +1,4 @@
-name: MistyTemp Dual Unity Android Build
+name: MistyTemp Dual Unity Native Library Build
 
 on:
   push:
@@ -8,6 +8,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   NDK_VERSION: "26.1.10909125"
   CMAKE_VERSION: "3.22.1"
@@ -16,8 +19,9 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.variant }} (${{ matrix.abi }})
+    name: Build ${{ matrix.variant }} Native Library
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     strategy:
       fail-fast: false
@@ -43,20 +47,15 @@ jobs:
           VARIANT="${{ matrix.variant }}"
           PROJECT_DIR=""
 
-          echo "Looking for project: ${VARIANT}"
-
-          # Already extracted into repository
           if [[ -f "${VARIANT}/gradlew" && -d "${VARIANT}/app" ]]; then
             PROJECT_DIR="${VARIANT}"
 
-          # Project is repository root
           elif [[ -f "gradlew" && -d "app" ]]; then
             PROJECT_DIR="."
 
           else
             ZIP_PATH="./MistyTemp_AntiQuit_DualUnity.zip"
 
-            # Find ZIP if filename or location differs
             if [[ ! -f "${ZIP_PATH}" ]]; then
               ZIP_PATH="$(find . -maxdepth 5 -type f \
                 -iname 'MistyTemp*.zip' -print -quit)"
@@ -68,58 +67,47 @@ jobs:
               exit 1
             fi
 
-            echo "ZIP found: ${ZIP_PATH}"
-
+            echo "Found ZIP: ${ZIP_PATH}"
             mkdir -p .build-source
 
-            # Python extraction supports LZMA-compressed ZIP files.
+            # Supports both ordinary ZIP and LZMA compression.
             python3 - "${ZIP_PATH}" <<'PY'
           import sys
           import zipfile
 
-          zip_path = sys.argv[1]
-
           try:
-              with zipfile.ZipFile(zip_path, "r") as archive:
+              with zipfile.ZipFile(sys.argv[1], "r") as archive:
                   bad_file = archive.testzip()
 
                   if bad_file:
-                      raise RuntimeError(
-                          f"Corrupt ZIP entry: {bad_file}"
-                      )
+                      raise RuntimeError(f"Corrupt ZIP entry: {bad_file}")
 
                   archive.extractall(".build-source")
 
               print("ZIP integrity verified.")
-              print("ZIP extraction completed.")
+              print("Extraction completed.")
 
           except Exception as error:
-              print(f"Extraction failed: {error}", file=sys.stderr)
+              print(f"ZIP extraction failed: {error}", file=sys.stderr)
               sys.exit(1)
           PY
 
-            # Find requested Unity project
             if [[ -f ".build-source/${VARIANT}/gradlew" && \
                   -d ".build-source/${VARIANT}/app" ]]; then
-
               PROJECT_DIR=".build-source/${VARIANT}"
-
             else
-              echo "::error::${VARIANT} was not found in ZIP."
-
+              echo "::error::Unity project ${VARIANT} not found."
               find .build-source -maxdepth 5 \
                 \( -name gradlew -o -name build.gradle \) -print
-
               exit 1
             fi
           fi
 
-          # Verify project structure
           test -f "${PROJECT_DIR}/gradlew"
           test -f "${PROJECT_DIR}/app/build.gradle"
+          test -f "${PROJECT_DIR}/app/src/main/cpp/CMakeLists.txt"
 
           echo "project_dir=${PROJECT_DIR}" >> "$GITHUB_OUTPUT"
-
           echo "Selected project: ${PROJECT_DIR}"
 
       # 3. Install Java
@@ -128,21 +116,18 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
-      # 4. Install Android SDK command-line tools
+      # 4. Configure Android SDK
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
           packages: ''
 
-      # 5. Install required SDK packages
+      # 5. Install native build dependencies
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "Installing Android SDK components..."
 
           sdkmanager --install \
             "platform-tools" \
@@ -157,7 +142,7 @@ jobs:
           echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
-          echo "SDK installation completed."
+          echo "Android SDK installation complete."
 
       # 6. Configure Gradle
       - name: Configure Gradle
@@ -175,52 +160,76 @@ jobs:
 
           ./gradlew --version
 
-      # 7. Compile Android APK
-      - name: Build Android APK
+      # 7. Compile native C++ library only
+      - name: Build MistyTemp native library
         working-directory: ${{ steps.project.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Building ${{ matrix.variant }}"
+          echo "Building native target MistyTemp"
+          echo "Unity variant: ${{ matrix.variant }}"
+          echo "Android ABI: ${{ matrix.abi }}"
 
-          ./gradlew :app:assembleDebug \
+          ./gradlew :app:externalNativeBuildDebug \
             --stacktrace \
             --no-daemon \
             -Pandroid.injected.build.abi="${{ matrix.abi }}"
 
-      # 8. Verify APK
-      - name: Verify APK output
+      # 8. Find and stage the compiled .so
+      - name: Collect native library
         working-directory: ${{ steps.project.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
 
-          APK_DIR="app/build/outputs/apk/debug"
+          ABI="${{ matrix.abi }}"
+          LIBRARY_NAME="libMistyTemp.so"
 
-          if [[ ! -d "${APK_DIR}" ]]; then
-            echo "::error::APK output directory missing."
+          mkdir -p native-artifacts
+
+          echo "Searching for ${LIBRARY_NAME}..."
+
+          mapfile -t LIBRARIES < <(
+            find app/build -type f \
+              -name "${LIBRARY_NAME}" \
+              -path "*/${ABI}/*"
+          )
+
+          if [[ ${#LIBRARIES[@]} -eq 0 ]]; then
+            echo "::error::${LIBRARY_NAME} was not generated for ${ABI}."
+
+            echo "All generated shared libraries:"
+            find app/build -type f -name "*.so" -print || true
+
+            echo "CMake build directories:"
+            find app/build -type d \
+              \( -name "cmake" -o -name "cxx" \) -print || true
+
             exit 1
           fi
 
-          APK_COUNT=$(find "${APK_DIR}" -type f -name "*.apk" | wc -l)
-
-          if [[ "${APK_COUNT}" -eq 0 ]]; then
-            echo "::error::No APK was generated."
-            exit 1
+          if [[ ${#LIBRARIES[@]} -gt 1 ]]; then
+            echo "Multiple matching libraries found:"
+            printf '%s\n' "${LIBRARIES[@]}"
           fi
 
-          echo "Generated APK files:"
-          find "${APK_DIR}" -type f -name "*.apk" -print
+          SOURCE_LIBRARY="${LIBRARIES[0]}"
 
-      # 9. Upload APK and native libraries
-      - name: Upload build artifacts
+          cp "${SOURCE_LIBRARY}" "native-artifacts/${LIBRARY_NAME}"
+
+          echo "Native library collected:"
+          ls -lh "native-artifacts/${LIBRARY_NAME}"
+          file "native-artifacts/${LIBRARY_NAME}"
+
+          echo "Library architecture:"
+          readelf -h "native-artifacts/${LIBRARY_NAME}" | grep -E 'Class:|Machine:'
+
+      # 9. Upload only the native library
+      - name: Upload compiled SO
         uses: actions/upload-artifact@v4
         with:
-          name: mistytemp-${{ matrix.variant }}-${{ matrix.abi }}
-          if-no-files-found: warn
-          path: |
-            ${{ steps.project.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
-            ${{ steps.project.outputs.project_dir }}/app/build/intermediates/stripped_native_libs/debug/out/lib/${{ matrix.abi }}/*.so
-            ${{ steps.project.outputs.project_dir }}/app/build/intermediates/cxx/Debug/**/obj/${{ matrix.abi }}/*.so
-            ${{ steps.project.outputs.project_dir }}/app/build/intermediates/cmake/debug/obj/${{ matrix.abi }}/*.so
+          name: mistytemp-${{ matrix.variant }}-${{ matrix.abi }}-SO
+          path: ${{ steps.project.outputs.project_dir }}/native-artifacts/libMistyTemp.so
+          if-no-files-found: error
+          retention-days: 14
