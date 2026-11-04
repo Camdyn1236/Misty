@@ -1,8 +1,11 @@
+
 name: MistyTemp Dual Unity Android Build
 
 on:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
   pull_request:
   workflow_dispatch:
 
@@ -16,6 +19,7 @@ jobs:
   build:
     name: Build ${{ matrix.variant }} (${{ matrix.abi }})
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
@@ -29,7 +33,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Locate or extract project ZIP
+      - name: Locate and extract project ZIP
         id: project
         shell: bash
         run: |
@@ -38,69 +42,105 @@ jobs:
           VARIANT="${{ matrix.variant }}"
           PROJECT_DIR=""
 
-          # Case 1: both Unity variant folders were committed directly.
+          # Check whether the project is already extracted.
           if [[ -f "${VARIANT}/gradlew" && -d "${VARIANT}/app" ]]; then
             PROJECT_DIR="${VARIANT}"
-          # Case 2: this variant is itself the repository root.
+
           elif [[ -f "gradlew" && -d "app" ]]; then
             PROJECT_DIR="."
-          else
-            # Case 3: the repository contains the uploaded dual-Unity ZIP.
-            ZIP_PATH="$(find . -maxdepth 3 -type f \
-              \( -iname 'MistyTemp_AntiQuit_DualUnity.zip' -o -iname 'MistyTemp*.zip' \) \
-              -print -quit)"
 
-            if [[ -z "${ZIP_PATH}" ]]; then
-              echo "::error::Could not find ${VARIANT}/gradlew, root gradlew, or MistyTemp*.zip."
-              echo "Repository files:"
-              find . -maxdepth 3 -type f | sort | head -200
+          else
+            # Look for the exact ZIP name first.
+            ZIP_PATH="./MistyTemp_AntiQuit_DualUnity.zip"
+
+            # Fall back to any MistyTemp ZIP in the repository.
+            if [[ ! -f "${ZIP_PATH}" ]]; then
+              ZIP_PATH="$(find . -maxdepth 4 -type f \
+                -iname 'MistyTemp*.zip' -print -quit)"
+            fi
+
+            if [[ -z "${ZIP_PATH}" || ! -f "${ZIP_PATH}" ]]; then
+              echo "::error::MistyTemp ZIP was not found."
+              echo "Repository contents:"
+              find . -maxdepth 4 -type f | sort | head -300
               exit 1
             fi
 
-            echo "Extracting: ${ZIP_PATH}"
-            mkdir -p .build-source
-            unzip -oq "${ZIP_PATH}" -d .build-source
+            echo "Found ZIP: ${ZIP_PATH}"
 
-            if [[ -f ".build-source/${VARIANT}/gradlew" && -d ".build-source/${VARIANT}/app" ]]; then
+            mkdir -p .build-source
+
+            # Python supports the LZMA compression used by the updated ZIP.
+            python3 - "${ZIP_PATH}" <<'PY'
+          import sys
+          import zipfile
+
+          zip_path = sys.argv[1]
+
+          try:
+              with zipfile.ZipFile(zip_path, "r") as archive:
+                  bad_file = archive.testzip()
+                  if bad_file:
+                      raise RuntimeError(f"Corrupt ZIP entry: {bad_file}")
+
+                  archive.extractall(".build-source")
+
+          except Exception as error:
+              print(f"ZIP extraction failed: {error}", file=sys.stderr)
+              sys.exit(1)
+
+          print("ZIP extracted and integrity checked.")
+          PY
+
+            # Confirm the expected Unity project exists.
+            if [[ -f ".build-source/${VARIANT}/gradlew" && \
+                  -d ".build-source/${VARIANT}/app" ]]; then
               PROJECT_DIR=".build-source/${VARIANT}"
             else
-              echo "::error::ZIP does not contain the expected ${VARIANT}/gradlew and ${VARIANT}/app layout."
-              find .build-source -maxdepth 4 -type f \( -name gradlew -o -name build.gradle \) -print
+              echo "::error::Could not find ${VARIANT} inside the extracted ZIP."
+              echo "Found Gradle projects:"
+              find .build-source -maxdepth 5 -type f \
+                \( -name gradlew -o -name build.gradle \) -print
               exit 1
             fi
           fi
 
+          if [[ ! -f "${PROJECT_DIR}/app/build.gradle" ]]; then
+            echo "::error::app/build.gradle is missing."
+            exit 1
+          fi
+
+          if [[ ! -f "${PROJECT_DIR}/gradlew" ]]; then
+            echo "::error::Gradle wrapper is missing."
+            exit 1
+          fi
+
           echo "project_dir=${PROJECT_DIR}" >> "${GITHUB_OUTPUT}"
-          echo "PROJECT_DIR=${PROJECT_DIR}" >> "${GITHUB_ENV}"
-          echo "Building project directory: ${PROJECT_DIR}"
-          test -f "${PROJECT_DIR}/gradlew"
-          test -d "${PROJECT_DIR}/app"
-          test -f "${PROJECT_DIR}/app/build.gradle"
+          echo "Building: ${PROJECT_DIR}"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
-          cache-dependency-path: |
-            ${{ steps.project.outputs.project_dir }}/gradle/wrapper/gradle-wrapper.properties
-            ${{ steps.project.outputs.project_dir }}/gradle/libs.versions.toml
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android build packages
+      - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
+
           yes | sdkmanager --licenses >/dev/null
+
           sdkmanager --install \
             "platform-tools" \
             "platforms;${ANDROID_PLATFORM}" \
             "build-tools;${BUILD_TOOLS_VERSION}" \
             "ndk;${NDK_VERSION}" \
             "cmake;${CMAKE_VERSION}"
+
           echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "${GITHUB_ENV}"
           echo "ANDROID_SDK_ROOT=${ANDROID_HOME}" >> "${GITHUB_ENV}"
 
@@ -109,28 +149,52 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           chmod +x ./gradlew
-          {
-            echo "sdk.dir=${ANDROID_HOME}"
-            echo "ndk.dir=${ANDROID_HOME}/ndk/${NDK_VERSION}"
-          } > local.properties
+
+          cat > local.properties <<EOF
+          sdk.dir=${ANDROID_HOME}
+          ndk.dir=${ANDROID_HOME}/ndk/${NDK_VERSION}
+          EOF
+
           ./gradlew --version
 
-      - name: Build debug APK and native library
+      - name: Build Android APK
         working-directory: ${{ steps.project.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
+
           ./gradlew :app:assembleDebug \
             --stacktrace \
             --no-daemon \
             -Pandroid.injected.build.abi="${{ matrix.abi }}"
 
+      - name: Verify APK output
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_DIR="app/build/outputs/apk/debug"
+
+          if [[ ! -d "${APK_DIR}" ]]; then
+            echo "::error::APK output directory was not created."
+            exit 1
+          fi
+
+          find "${APK_DIR}" -type f -name "*.apk" -print
+
+          if ! find "${APK_DIR}" -type f -name "*.apk" | grep -q .; then
+            echo "::error::No APK was generated."
+            exit 1
+          fi
+
       - name: Upload APK and native libraries
         uses: actions/upload-artifact@v4
         with:
           name: mistytemp-${{ matrix.variant }}-${{ matrix.abi }}
-          if-no-files-found: error
+          if-no-files-found: warn
           path: |
             ${{ steps.project.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
             ${{ steps.project.outputs.project_dir }}/app/build/intermediates/stripped_native_libs/debug/out/lib/${{ matrix.abi }}/*.so
